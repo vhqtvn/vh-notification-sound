@@ -4,18 +4,40 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     os::fd::IntoRawFd,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
 };
-use libc;
+// Import specific items from libc instead of the entire module
+use libc::{close, dup2, fork, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, setsid};
+
+// Define notification states for state tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum NotificationState {
+    FadingOut,
+    Playing,
+    FadingIn,
+    Idle,
+}
+
+// Common constant for fade steps
+const FADE_STEPS: u8 = 10;
+
+// Lock file information including notification state
+#[derive(Debug, Serialize, Deserialize)]
+struct LockInfo {
+    pid: u32,
+    state: NotificationState,
+    // Used for IPC to request new notifications
+    new_request: Option<String>,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, 
@@ -90,6 +112,8 @@ struct AudioStateGuard {
     current_volume: u8,
     unmuted_inputs: Vec<String>,
     cleaned_up: bool,
+    // Current fade state (0 = fully faded out, FADE_STEPS = full volume)
+    fade_state: u8,
 }
 
 impl AudioStateGuard {
@@ -99,6 +123,7 @@ impl AudioStateGuard {
             current_volume: state.current_volume,
             unmuted_inputs: state.unmuted_inputs,
             cleaned_up: false,
+            fade_state: FADE_STEPS, // Start at full volume
         }
     }
 
@@ -134,18 +159,21 @@ impl Drop for AudioStateGuard {
     }
 }
 
-fn main() -> Result<()> {
-    // Set up signal handling for clean shutdown
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    
-    // Handle Ctrl+C
-    ctrlc::set_handler(move || {
-        eprintln!("Received interrupt signal, cleaning up...");
-        r.store(false, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
+// Add this struct before the play_notification function
+struct NotificationContext<'a> {
+    sound_path: PathBuf,
+    fade_out: f32,
+    fade_in: f32,
+    volume: u8,
+    running: &'a Arc<AtomicBool>,
+    lock_path: &'a PathBuf,
+    notification_queue: &'a Arc<Mutex<Vec<PathBuf>>>,
+    guard: &'a mut AudioStateGuard,
+    enable_fading: bool,
+    audio_already_prepared: bool,
+}
 
+fn main() -> Result<()> {
     // Parse all arguments
     let args = Args::parse();
     
@@ -176,21 +204,16 @@ fn main() -> Result<()> {
     };
     
     // Determine parameters with proper precedence: command line > environment > config > defaults
-    // Command line args are now Option types, so we can directly check if they were provided
-    
-    // For fade_out: command line > environment > config > default (0.3)
     let fade_out = args.fade_out
         .or_else(|| std::env::var("VH_NOTIFICATION_FADE_OUT").ok().and_then(|v| v.parse().ok()))
         .or(config.fade_out)
         .unwrap_or(0.3);
     
-    // For fade_in: command line > environment > config > default (0.3)
     let fade_in = args.fade_in
         .or_else(|| std::env::var("VH_NOTIFICATION_FADE_IN").ok().and_then(|v| v.parse().ok()))
         .or(config.fade_in)
         .unwrap_or(0.3);
     
-    // For volume: command line > environment > config > default (75), capped at 100
     let volume = args.volume
         .or_else(|| std::env::var("VH_NOTIFICATION_VOLUME").ok().and_then(|v| v.parse().ok()))
         .or(config.volume)
@@ -202,7 +225,7 @@ fn main() -> Result<()> {
 
     // If detach is enabled, fork the process
     if args.detach {
-        match unsafe { libc::fork() } {
+        match unsafe { fork() } {
             -1 => {
                 return Err(anyhow::anyhow!("Failed to fork process"));
             }
@@ -211,14 +234,14 @@ fn main() -> Result<()> {
                 // Redirect standard file descriptors to /dev/null
                 let null_fd = std::fs::File::open("/dev/null")?.into_raw_fd();
                 unsafe {
-                    libc::dup2(null_fd, libc::STDIN_FILENO);
-                    libc::dup2(null_fd, libc::STDOUT_FILENO);
-                    libc::dup2(null_fd, libc::STDERR_FILENO);
-                    libc::close(null_fd);
+                    dup2(null_fd, STDIN_FILENO);
+                    dup2(null_fd, STDOUT_FILENO);
+                    dup2(null_fd, STDERR_FILENO);
+                    close(null_fd);
                 }
                 
                 // Create a new session
-                if unsafe { libc::setsid() } < 0 {
+                if unsafe { setsid() } < 0 {
                     std::process::exit(1);
                 }
             }
@@ -229,29 +252,382 @@ fn main() -> Result<()> {
         }
     }
 
-    // Acquire lock to prevent multiple notifications from playing simultaneously
+    // Set up signal handling for clean shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    
+    ctrlc::set_handler(move || {
+        eprintln!("Received interrupt signal, cleaning up...");
+        r.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    // Determine lock file path
     let lock_path = dirs::runtime_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("vh-notification-sound.lock");
 
-    let lock_file = match acquire_lock(&lock_path) {
-        Ok(file) => file,
+    // Try to acquire lock or send request to existing server
+    match acquire_lock(&lock_path, &sound_path.to_string_lossy()) {
+        Ok(None) => {
+            // No existing notification server, start a new one
+            run_notification_server(sound_path, fade_out, fade_in, volume, running, lock_path)?;
+        },
+        Ok(Some(_)) => {
+            // Successfully communicated with existing process
+            eprintln!("Notification request sent to running instance.");
+        },
         Err(e) => {
-            eprintln!("Another notification is currently playing: {}", e);
-            return Ok(());
+            eprintln!("Error communicating with notification server: {}", e);
         }
+    }
+    
+    Ok(())
+}
+
+fn run_notification_server(
+    initial_sound: PathBuf,
+    fade_out: f32,
+    fade_in: f32,
+    volume: u8,
+    running: Arc<AtomicBool>,
+    lock_path: PathBuf,
+) -> Result<()> {
+    // Notification queue
+    let notification_queue = Arc::new(Mutex::new(vec![initial_sound]));
+    
+    // Initialize the lock file with our PID and initial state
+    let lock_info = LockInfo {
+        pid: std::process::id(),
+        state: NotificationState::Idle,
+        new_request: None,
     };
     
-    // Play the notification sound with fade effects
-    let result = play_notification(sound_path, fade_out, fade_in, volume, running);
+    update_lock_file(&lock_path, &lock_info)?;
     
-    // Release lock
-    if let Some(mut file) = lock_file {
-        let _ = file.write_all(b"0");
+    // Create a thread to check for new notification requests
+    let lock_path_clone = lock_path.clone();
+    let running_clone = running.clone();
+    let queue_clone = notification_queue.clone();
+    
+    thread::spawn(move || {
+        let check_interval = Duration::from_millis(10);
+        while running_clone.load(Ordering::SeqCst) {
+            // Check for new notification requests in the lock file
+            if let Ok(lock_info) = read_lock_file(&lock_path_clone) {
+                if let Some(new_sound_path) = lock_info.new_request {
+                    // Add new sound to queue
+                    let mut queue = queue_clone.lock().unwrap();
+                    queue.push(PathBuf::from(&new_sound_path));
+                    
+                    // Clear the request from the lock file
+                    if let Ok(mut updated_info) = read_lock_file(&lock_path_clone) {
+                        updated_info.new_request = None;
+                        let _ = update_lock_file(&lock_path_clone, &updated_info);
+                    }
+                }
+            }
+            thread::sleep(check_interval);
+        }
+    });
+    
+    // Get initial PulseAudio state once for the entire server
+    let state = get_pulseaudio_state()?;
+    let mut guard = AudioStateGuard::new(state);
+    let enable_fading = !guard.unmuted_inputs.is_empty();
+    
+    // Track whether audio is already prepared for notifications
+    // Audio is considered prepared when fade_state is close to 0 (faded out)
+    let mut audio_already_prepared = false;
+    
+    // Main notification playback loop
+    while running.load(Ordering::SeqCst) {
+        // Get next notification from queue
+        let sound_to_play = {
+            let mut queue = notification_queue.lock().unwrap();
+            if queue.is_empty() {
+                break; // No more notifications to play, exit loop
+            }
+            queue.remove(0) // Take the first notification from queue
+        };
+        
+        // Update lock file state
+        if let Ok(mut lock_info) = read_lock_file(&lock_path) {
+            lock_info.state = NotificationState::Idle;
+            update_lock_file(&lock_path, &lock_info)?;
+        }
+        
+        // Play the notification sound
+        let ctx = &mut NotificationContext {
+            sound_path: sound_to_play,
+            fade_out,
+            fade_in,
+            volume,
+            running: &running,
+            lock_path: &lock_path,
+            notification_queue: &notification_queue,
+            guard: &mut guard,
+            enable_fading,
+            audio_already_prepared,
+        };
+        
+        let (completed, interrupted) = play_notification(ctx)?;
+
+        // Update the audio preparation state for the next notification
+        if interrupted {
+            // If this notification was interrupted, audio is already prepared for the next one
+            // Audio is considered prepared when fade_state is close to 0 (faded out)
+            audio_already_prepared = guard.fade_state < FADE_STEPS / 2;
+        } else if completed {
+            // If the notification played completely with fade-in, audio should be restored
+            // Audio is considered not prepared when fade_state is close to FADE_STEPS (full volume)
+            audio_already_prepared = false;
+        }
+        
+        // Check if we're done with all notifications
+        let no_more_notifications = notification_queue.lock().unwrap().is_empty();
+        
+        // If we're done (or shutting down) and audio was not fully restored, do it now
+        if (no_more_notifications || !running.load(Ordering::SeqCst)) && 
+           (interrupted || !completed) {
+            // Ensure audio state is fully restored
+            guard.cleanup()?;
+            audio_already_prepared = false;
+            guard.fade_state = FADE_STEPS; // Reset fade state to full volume
+        }
     }
-    let _ = std::fs::remove_file(lock_path);
     
-    result
+    // Ensure audio state is fully restored before exiting
+    guard.cleanup()?;
+    guard.fade_state = FADE_STEPS; // Reset fade state to full volume
+    
+    // Clean up lock file before exiting
+    let _ = std::fs::remove_file(&lock_path);
+
+    Ok(())
+}
+
+// Refactored play_notification function
+fn play_notification(
+    ctx: &mut NotificationContext,
+) -> Result<(bool, bool)> {
+    // Track whether playback was interrupted
+    let mut _was_interrupted = false;
+    
+    // Only prepare audio (fade out and mute) if it's not already prepared
+    if !ctx.audio_already_prepared {
+        // Update lock file state to FadingOut
+        if let Ok(mut lock_info) = read_lock_file(ctx.lock_path) {
+            lock_info.state = NotificationState::FadingOut;
+            update_lock_file(ctx.lock_path, &lock_info)?;
+        }
+        
+        // Fade out if needed and we have active audio streams
+        if ctx.enable_fading && ctx.fade_out > 0.0 && ctx.running.load(Ordering::SeqCst) {
+            fade_audio_out(ctx.guard, ctx.fade_out, ctx.running)?;
+        } else {
+            // If we're skipping the fade out, set fade_state to 0 (fully faded out)
+            ctx.guard.fade_state = 0;
+        }
+        
+        // Check if we should continue (user might have interrupted)
+        if !ctx.running.load(Ordering::SeqCst) {
+            return Ok((false, false));
+        }
+        
+        // Mute all unmuted sink inputs
+        for input in &ctx.guard.unmuted_inputs {
+            run_command("pactl", &["set-sink-input-mute", input, "1"])?;
+        }
+        
+        // Set volume for notification
+        run_command(
+            "pactl",
+            &["set-sink-volume", &ctx.guard.default_sink, &format!("{}%", ctx.volume)],
+        )?;
+    }
+    
+    // Update lock file state to Playing
+    if let Ok(mut lock_info) = read_lock_file(ctx.lock_path) {
+        lock_info.state = NotificationState::Playing;
+        update_lock_file(ctx.lock_path, &lock_info)?;
+    }
+    
+    // Play the notification sound
+    let sound_path_str = ctx.sound_path.to_string_lossy().to_string();
+    let should_interrupt = Arc::new(AtomicBool::new(false));
+    let should_interrupt_clone = should_interrupt.clone();
+    
+    // Thread to check if a new notification arrived while playing
+    let notification_queue_clone = ctx.notification_queue.clone();
+    let running_clone = ctx.running.clone();
+    let sound_path_str_clone = sound_path_str.clone();
+    let play_running = Arc::new(AtomicBool::new(true));
+    let play_running_clone = play_running.clone();
+    
+    let monitor_thread = thread::spawn(move || {
+        let check_interval = Duration::from_millis(50);
+        let start_time = std::time::Instant::now();
+        
+        while running_clone.load(Ordering::SeqCst) && play_running_clone.load(Ordering::SeqCst) {
+            // If queue has new items (beyond what we're currently playing)
+            if notification_queue_clone.lock().unwrap().len() > 0 {
+                // Signal to interrupt current playback
+                should_interrupt_clone.store(true, Ordering::SeqCst);
+                
+                // Try to kill paplay
+                let _ = run_command("pkill", &["-f", &format!("paplay.*{}", sound_path_str_clone)]);
+                break;
+            }
+            
+            thread::sleep(check_interval);
+            
+            // Safety timeout (10 seconds) to avoid hanging if something goes wrong
+            if start_time.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+        }
+    });
+    
+    // Play the sound in the main thread (we'll interrupt if needed)
+    let _play_result = run_command("paplay", &[&sound_path_str]);
+    play_running.store(false, Ordering::SeqCst);
+    // Wait for the monitor thread to finish
+    let _ = monitor_thread.join();
+    
+    // Check if we were interrupted or have a new notification waiting
+    if should_interrupt.load(Ordering::SeqCst) || !ctx.notification_queue.lock().unwrap().is_empty() {
+        _was_interrupted = true;
+        // Keep fade_state as is - we're already faded out
+        // Skip fade-in if interrupted or new notification waiting
+        return Ok((false, true));
+    }
+    
+    // Check if we should continue with fade-in
+    if !ctx.running.load(Ordering::SeqCst) {
+        return Ok((false, false));
+    }
+    
+    // Update lock file state to FadingIn
+    if let Ok(mut lock_info) = read_lock_file(ctx.lock_path) {
+        lock_info.state = NotificationState::FadingIn;
+        update_lock_file(ctx.lock_path, &lock_info)?;
+    }
+    
+    // Unmute all previously unmuted inputs
+    for input in &ctx.guard.unmuted_inputs {
+        run_command("pactl", &["set-sink-input-mute", input, "0"])?;
+    }
+    
+    // Fade in if needed
+    if ctx.enable_fading && ctx.fade_in > 0.0 && ctx.running.load(Ordering::SeqCst) {
+        fade_audio_in(ctx.guard, ctx.fade_in, ctx.running, ctx.notification_queue)?;
+        
+        // Check again after fade-in if we were interrupted
+        if !ctx.notification_queue.lock().unwrap().is_empty() {
+            _was_interrupted = true;
+            // fade_state is already updated in fade_audio_in
+            return Ok((false, true));
+        }
+    } else {
+        // If we skipped fade-in, make sure volume is restored and fade_state is reset
+        run_command(
+            "pactl",
+            &["set-sink-volume", &ctx.guard.default_sink, &format!("{}%", ctx.guard.current_volume)],
+        )?;
+        ctx.guard.fade_state = FADE_STEPS; // Fully faded in
+    }
+    
+    // Update lock file state to Idle
+    if let Ok(mut lock_info) = read_lock_file(ctx.lock_path) {
+        lock_info.state = NotificationState::Idle;
+        update_lock_file(ctx.lock_path, &lock_info)?;
+    }
+    
+    // Return completion status: (completed successfully, was interrupted)
+    Ok((true, false))
+}
+
+fn fade_audio_out(
+    guard: &mut AudioStateGuard,
+    fade_out: f32,
+    running: &Arc<AtomicBool>,
+) -> Result<()> {
+    // Use the existing fade_state as the starting point
+    let start_step = guard.fade_state;
+    let fade_out_step_duration = Duration::from_secs_f32(fade_out / FADE_STEPS as f32);
+    
+    // Starting from current fade_state and going down to 0
+    for step in (0..start_step).rev() {
+        if !running.load(Ordering::SeqCst) {
+            // Remember the current fade state before exiting
+            guard.fade_state = step + 1;
+            break;
+        }
+        
+        let volume_factor = step as f32 / FADE_STEPS as f32;
+        let step_volume = (guard.current_volume as f32 * volume_factor) as u8;
+        
+        run_command(
+            "pactl",
+            &["set-sink-volume", &guard.default_sink, &format!("{}%", step_volume)],
+        )?;
+        
+        // Update the fade state after each step
+        guard.fade_state = step;
+        
+        thread::sleep(fade_out_step_duration);
+    }
+    
+    Ok(())
+}
+
+fn fade_audio_in(
+    guard: &mut AudioStateGuard,
+    fade_in: f32,
+    running: &Arc<AtomicBool>,
+    notification_queue: &Arc<Mutex<Vec<PathBuf>>>,
+) -> Result<()> {
+    // Use the existing fade_state as the starting point
+    let start_step = guard.fade_state;
+    let fade_in_step_duration = Duration::from_secs_f32(fade_in / FADE_STEPS as f32);
+    
+    // Starting from current fade_state and going up to FADE_STEPS
+    for step in start_step..=FADE_STEPS {
+        // Check for new notifications
+        if !notification_queue.lock().unwrap().is_empty() {
+            // New notification came in, remember current fade state
+            guard.fade_state = step;
+            return Ok(());
+        }
+        
+        if !running.load(Ordering::SeqCst) {
+            // Remember the current fade state before exiting
+            guard.fade_state = step;
+            break;
+        }
+        
+        let volume_factor = step as f32 / FADE_STEPS as f32;
+        let step_volume = (guard.current_volume as f32 * volume_factor) as u8;
+        
+        run_command(
+            "pactl",
+            &["set-sink-volume", &guard.default_sink, &format!("{}%", step_volume)],
+        )?;
+        
+        // Update the fade state after each step
+        guard.fade_state = step;
+        
+        thread::sleep(fade_in_step_duration);
+    }
+    
+    // Final volume restoration
+    run_command(
+        "pactl",
+        &["set-sink-volume", &guard.default_sink, &format!("{}%", guard.current_volume)],
+    )?;
+    
+    Ok(())
 }
 
 fn load_config(config_path: &Option<PathBuf>) -> Result<Config> {
@@ -377,82 +753,78 @@ fn get_pulseaudio_state() -> Result<PulseAudioState> {
     })
 }
 
-fn play_notification(
-    sound_path: PathBuf, 
-    fade_out: f32, 
-    fade_in: f32, 
-    volume: u8,
-    running: Arc<AtomicBool>
-) -> Result<()> {
-    // Get current PulseAudio state
-    let state = get_pulseaudio_state()?;
-
-    let enable_fading = state.unmuted_inputs.len() > 0;
+fn update_lock_file(lock_path: &PathBuf, lock_info: &LockInfo) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(lock_path)?;
     
-    // Create a guard that will automatically restore audio state when dropped
-    let mut guard = AudioStateGuard::new(state);
-    
-    // Fade out if needed and still running
-    if enable_fading && fade_out > 0.0 && running.load(Ordering::SeqCst) {
-        let fade_out_steps = 10;
-        let fade_out_step_duration = Duration::from_secs_f32(fade_out / fade_out_steps as f32);
-        
-        for step in 0..fade_out_steps {
-            if !running.load(Ordering::SeqCst) {
-                break;
-            }
-            
-            let volume_factor = 1.0 - (step as f32 / fade_out_steps as f32);
-            let step_volume = (guard.current_volume as f32 * volume_factor) as u8;
-            run_command("pactl", &["set-sink-volume", &guard.default_sink, &format!("{}%", step_volume)])?;
-            thread::sleep(fade_out_step_duration);
-        }
-    }
-    
-    // If we're still running, continue with notification
-    if running.load(Ordering::SeqCst) {
-        // Mute all unmuted sink inputs
-        for input in &guard.unmuted_inputs {
-            run_command("pactl", &["set-sink-input-mute", input, "1"])?;
-        }
-        
-        // Set volume for notification
-        run_command("pactl", &["set-sink-volume", &guard.default_sink, &format!("{}%", volume)])?;
-        
-        // Play the notification sound
-        let sound_path_str = sound_path.to_string_lossy();
-        run_command("paplay", &[&sound_path_str])?;
-        
-        // Fade in if needed and still running
-        if enable_fading && fade_in > 0.0 && running.load(Ordering::SeqCst) {
-            // Unmute all previously unmuted inputs
-            for input in &guard.unmuted_inputs {
-                run_command("pactl", &["set-sink-input-mute", input, "0"])?;
-            }
-            
-            let fade_in_steps = 10;
-            let fade_in_step_duration = Duration::from_secs_f32(fade_in / fade_in_steps as f32);
-            
-            for step in 0..fade_in_steps {
-                if !running.load(Ordering::SeqCst) {
-                    break;
-                }
-                
-                let volume_factor = step as f32 / fade_in_steps as f32;
-                let step_volume = (guard.current_volume as f32 * volume_factor) as u8;
-                run_command("pactl", &["set-sink-volume", &guard.default_sink, &format!("{}%", step_volume)])?;
-                thread::sleep(fade_in_step_duration);
-            }
-        } else {
-            // If no fade-in or interrupted, just restore everything
-            guard.cleanup()?;
-        }
-    }
-    
-    // The guard will automatically call cleanup when it goes out of scope
-    // This ensures cleanup happens even if there's an error or interruption
+    serde_json::to_writer(&file, &lock_info)?;
     
     Ok(())
+}
+
+fn read_lock_file(lock_path: &PathBuf) -> Result<LockInfo> {
+    let file = OpenOptions::new()
+        .read(true)
+        .open(lock_path)?;
+    
+    let lock_info: LockInfo = serde_json::from_reader(file)?;
+    
+    Ok(lock_info)
+}
+
+fn acquire_lock(lock_path: &PathBuf, sound_path: &str) -> Result<Option<File>> {
+    // Check if lock file exists and is valid
+    if lock_path.exists() {
+        // Try to read the lock file as JSON
+        match read_lock_file(lock_path) {
+            Ok(lock_info) => {
+                // Check if the process in the lock file is still running
+                let proc_path = PathBuf::from(format!("/proc/{}", lock_info.pid));
+                if proc_path.exists() {
+                    // The process is still running, send a new notification request
+                    let mut updated_info = lock_info;
+                    updated_info.new_request = Some(sound_path.to_string());
+                    update_lock_file(lock_path, &updated_info)?;
+                    return Ok(Some(File::open(lock_path)?));
+                } else {
+                    // Process is not running, remove stale lock
+                    std::fs::remove_file(lock_path)?;
+                }
+            },
+            Err(_) => {
+                // Lock file exists but isn't in our format, try to read it as plain text for backward compatibility
+                let mut file = File::open(lock_path)?;
+                let mut contents = String::new();
+                file.read_to_string(&mut contents)?;
+                
+                // Check if the process in the lock file is still running
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    let proc_path = PathBuf::from(format!("/proc/{}", pid));
+                    if proc_path.exists() {
+                        return Err(anyhow::anyhow!("Another notification is currently playing (PID: {}).", pid));
+                    }
+                }
+                
+                // If the process is not running, remove the stale lock
+                std::fs::remove_file(lock_path)?;
+            }
+        }
+    }
+    
+    // Create new lock file with initial state
+    let initial_lock_info = LockInfo {
+        pid: std::process::id(),
+        state: NotificationState::Idle,
+        new_request: None,
+    };
+    
+    update_lock_file(lock_path, &initial_lock_info)?;
+    
+    // Return None to indicate we're starting a new process
+    Ok(None)
 }
 
 fn print_help_info() {
@@ -503,39 +875,4 @@ fn print_sound_aliases(config: &Config) {
     for (alias, path) in &config.sounds {
         println!("  {}: {}", alias, path);
     }
-}
-
-fn acquire_lock(lock_path: &PathBuf) -> Result<Option<File>> {
-    // Check if lock file exists and is valid
-    if lock_path.exists() {
-        let mut file = File::open(lock_path)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        
-        // Check if the process in the lock file is still running
-        if let Ok(pid) = contents.trim().parse::<i32>() {
-            let proc_path = PathBuf::from(format!("/proc/{}", pid));
-            if proc_path.exists() {
-                return Err(anyhow::anyhow!("Another notification is currently playing (PID: {}).", pid));
-            }
-        }
-        
-        // If the process is not running, remove the stale lock
-        std::fs::remove_file(lock_path)?;
-    }
-    
-    // Create new lock file
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(lock_path)?;
-    
-    // Write current PID to lock file
-    let pid = std::process::id().to_string();
-    let mut lock_file = file;
-    lock_file.write_all(pid.as_bytes())?;
-    lock_file.flush()?;
-    
-    Ok(Some(lock_file))
 }
