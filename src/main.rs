@@ -3,6 +3,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    os::fd::IntoRawFd,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -12,6 +15,7 @@ use std::{
     thread,
     time::Duration,
 };
+use libc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, 
@@ -45,6 +49,10 @@ struct Args {
     /// Show help information about the application
     #[arg(short = 'h', long)]
     help_info: bool,
+
+    /// Detach process and run in background
+    #[arg(short = 'd', long, env = "VH_NOTIFICATION_DETACH")]
+    detach: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,11 +183,59 @@ fn main() -> Result<()> {
     
     // Resolve sound path (check if it's an alias in config)
     let sound_path = resolve_sound_path(&sound, &config)?;
+
+    // If detach is enabled, fork the process
+    if args.detach {
+        match unsafe { libc::fork() } {
+            -1 => {
+                return Err(anyhow::anyhow!("Failed to fork process"));
+            }
+            0 => {
+                // Child process continues
+                // Redirect standard file descriptors to /dev/null
+                let null_fd = std::fs::File::open("/dev/null")?.into_raw_fd();
+                unsafe {
+                    libc::dup2(null_fd, libc::STDIN_FILENO);
+                    libc::dup2(null_fd, libc::STDOUT_FILENO);
+                    libc::dup2(null_fd, libc::STDERR_FILENO);
+                    libc::close(null_fd);
+                }
+                
+                // Create a new session
+                if unsafe { libc::setsid() } < 0 {
+                    std::process::exit(1);
+                }
+            }
+            _ => {
+                // Parent process exits
+                return Ok(());
+            }
+        }
+    }
+
+    // Acquire lock to prevent multiple notifications from playing simultaneously
+    let lock_path = dirs::runtime_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("vh-notification-sound.lock");
+
+    let lock_file = match acquire_lock(&lock_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("Another notification is currently playing: {}", e);
+            return Ok(());
+        }
+    };
     
     // Play the notification sound with fade effects
-    play_notification(sound_path, fade_out, fade_in, volume, running)?;
+    let result = play_notification(sound_path, fade_out, fade_in, volume, running);
     
-    Ok(())
+    // Release lock
+    if let Some(mut file) = lock_file {
+        let _ = file.write_all(b"0");
+    }
+    let _ = std::fs::remove_file(lock_path);
+    
+    result
 }
 
 fn load_config(config_path: &Option<PathBuf>) -> Result<Config> {
@@ -314,12 +370,14 @@ fn play_notification(
 ) -> Result<()> {
     // Get current PulseAudio state
     let state = get_pulseaudio_state()?;
+
+    let enable_fading = state.unmuted_inputs.len() > 0;
     
     // Create a guard that will automatically restore audio state when dropped
     let mut guard = AudioStateGuard::new(state);
     
     // Fade out if needed and still running
-    if fade_out > 0.0 && running.load(Ordering::SeqCst) {
+    if enable_fading && fade_out > 0.0 && running.load(Ordering::SeqCst) {
         let fade_out_steps = 10;
         let fade_out_step_duration = Duration::from_secs_f32(fade_out / fade_out_steps as f32);
         
@@ -350,7 +408,7 @@ fn play_notification(
         run_command("paplay", &[&sound_path_str])?;
         
         // Fade in if needed and still running
-        if fade_in > 0.0 && running.load(Ordering::SeqCst) {
+        if enable_fading && fade_in > 0.0 && running.load(Ordering::SeqCst) {
             // Unmute all previously unmuted inputs
             for input in &guard.unmuted_inputs {
                 run_command("pactl", &["set-sink-input-mute", input, "0"])?;
@@ -401,6 +459,7 @@ fn print_help_info() {
     println!("  -c, --config <FILE>        Path to config file");
     println!("  -l, --list-sounds          List available sound aliases from config");
     println!("  -h, --help-info            Show this help information");
+    println!("  -d, --detach               Detach process and run in background");
     println!("      --help                 Show the automatically generated help message");
     println!();
     println!("ENVIRONMENT VARIABLES:");
@@ -408,10 +467,12 @@ fn print_help_info() {
     println!("  VH_NOTIFICATION_FADE_IN    Default fade-in duration in seconds");
     println!("  VH_NOTIFICATION_VOLUME     Default output volume percentage (0-100)");
     println!("  VH_NOTIFICATION_CONFIG     Path to the configuration file");
+    println!("  VH_NOTIFICATION_DETACH     Detach process and run in background");
     println!();
     println!("EXAMPLES:");
     println!("  vh-notification-sound default");
     println!("  vh-notification-sound --fade-out 0.5 --fade-in 0.2 --volume 80 /path/to/sound.mp3");
+    println!("  vh-notification-sound -d default");
     println!("  vh-notification-sound -l");
 }
 
@@ -426,4 +487,39 @@ fn print_sound_aliases(config: &Config) {
     for (alias, path) in &config.sounds {
         println!("  {}: {}", alias, path);
     }
+}
+
+fn acquire_lock(lock_path: &PathBuf) -> Result<Option<File>> {
+    // Check if lock file exists and is valid
+    if lock_path.exists() {
+        let mut file = File::open(lock_path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        
+        // Check if the process in the lock file is still running
+        if let Ok(pid) = contents.trim().parse::<i32>() {
+            let proc_path = PathBuf::from(format!("/proc/{}", pid));
+            if proc_path.exists() {
+                return Err(anyhow::anyhow!("Another notification is currently playing (PID: {}).", pid));
+            }
+        }
+        
+        // If the process is not running, remove the stale lock
+        std::fs::remove_file(lock_path)?;
+    }
+    
+    // Create new lock file
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(lock_path)?;
+    
+    // Write current PID to lock file
+    let pid = std::process::id().to_string();
+    let mut lock_file = file;
+    lock_file.write_all(pid.as_bytes())?;
+    lock_file.flush()?;
+    
+    Ok(Some(lock_file))
 }
