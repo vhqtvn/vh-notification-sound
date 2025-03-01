@@ -1,0 +1,16 @@
+# vh-notification-sound configuration file
+
+# Default fade durations in seconds
+fade_out: 0.5
+fade_in: 0.3
+
+# Output volume percentage for notification sound (0-100)
+volume: 75
+
+# Sound aliases
+sounds:
+  default: /usr/share/sounds/freedesktop/stereo/message.oga
+  error: /usr/share/sounds/freedesktop/stereo/dialog-error.oga
+  warning: /usr/share/sounds/freedesktop/stereo/dialog-warning.oga
+  complete: /usr/share/sounds/freedesktop/stereo/complete.oga
+  bell: /usr/share/sounds/freedesktop/stereo/bell.oga 

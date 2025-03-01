@@ -1,0 +1,172 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Run when tag matches v*, e.g. v1.0, v20.15.10
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: vh-notification-sound
+            asset_name: vh-notification-sound-linux-amd64
+            use_cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: vh-notification-sound
+            asset_name: vh-notification-sound-linux-arm64
+            use_cross: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install dependencies (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpulse-dev
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Create platform note
+        shell: bash
+        run: |
+          echo "# Platform Note" > PLATFORM_NOTE.md
+          echo "" >> PLATFORM_NOTE.md
+          echo "This application requires PulseAudio to be installed on your system." >> PLATFORM_NOTE.md
+          echo "It is designed to work on Linux systems with PulseAudio as the audio server." >> PLATFORM_NOTE.md
+          echo "" >> PLATFORM_NOTE.md
+          echo "## Dependencies" >> PLATFORM_NOTE.md
+          echo "" >> PLATFORM_NOTE.md
+          echo "- PulseAudio (`libpulse0`)" >> PLATFORM_NOTE.md
+          echo "- PulseAudio utilities (`pulseaudio-utils`)" >> PLATFORM_NOTE.md
+          echo "" >> PLATFORM_NOTE.md
+          echo "## Installation" >> PLATFORM_NOTE.md
+          echo "" >> PLATFORM_NOTE.md
+          echo "```bash" >> PLATFORM_NOTE.md
+          echo "# On Debian/Ubuntu" >> PLATFORM_NOTE.md
+          echo "sudo apt-get install libpulse0 pulseaudio-utils" >> PLATFORM_NOTE.md
+          echo "" >> PLATFORM_NOTE.md
+          echo "# On Fedora/RHEL" >> PLATFORM_NOTE.md
+          echo "sudo dnf install pulseaudio-libs pulseaudio-utils" >> PLATFORM_NOTE.md
+          echo "" >> PLATFORM_NOTE.md
+          echo "# On Arch Linux" >> PLATFORM_NOTE.md
+          echo "sudo pacman -S libpulse pulseaudio-utils" >> PLATFORM_NOTE.md
+          echo "```" >> PLATFORM_NOTE.md
+
+      - name: Build with Cargo
+        if: ${{ !matrix.use_cross }}
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+
+      - name: Build with Cross
+        if: ${{ matrix.use_cross }}
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.asset_name }}
+          cp README.md artifacts/
+          cp PLATFORM_NOTE.md artifacts/
+          cp vh-notification-sound.yml artifacts/
+
+      - name: Create archive
+        shell: bash
+        run: |
+          cd artifacts
+          tar -czvf ../${{ matrix.asset_name }}.tar.gz *
+          cd ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release and Upload Assets
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs').promises;
+            const path = require('path');
+            
+            // Extract version from tag (e.g., 'v1.0.0' -> '1.0.0')
+            const version = context.ref.replace('refs/tags/', '');
+            
+            // Create a release
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: version,
+              name: `Release ${version}`,
+              draft: false,
+              prerelease: false,
+              generate_release_notes: true
+            });
+            
+            // Get the list of artifact directories
+            const artifactDirs = await fs.readdir('.');
+            
+            // Find and upload all tar.gz files
+            for (const dir of artifactDirs) {
+              try {
+                const dirStat = await fs.stat(dir);
+                if (dirStat.isDirectory()) {
+                  const files = await fs.readdir(dir);
+                  for (const file of files) {
+                    if (file.endsWith('.tar.gz')) {
+                      const filePath = path.join(dir, file);
+                      const data = await fs.readFile(filePath);
+                      
+                      console.log(`Uploading ${file}...`);
+                      await github.rest.repos.uploadReleaseAsset({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        release_id: release.data.id,
+                        name: file,
+                        data: data
+                      });
+                      console.log(`Successfully uploaded ${file}`);
+                    }
+                  }
+                }
+              } catch (error) {
+                console.error(`Error processing directory ${dir}: ${error.message}`);
+              }
+            } 

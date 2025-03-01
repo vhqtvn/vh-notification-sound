@@ -1,0 +1,12 @@
+[package]
+name = "vh-notification-sound"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4.6", features = ["derive", "env"] }
+serde = { version = "1.0.188", features = ["derive"] }
+serde_yaml = "0.9.25"
+anyhow = "1.0.75"
+dirs = "5.0.1"
+ctrlc = "3.4.1"
