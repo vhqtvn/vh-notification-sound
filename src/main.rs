@@ -27,16 +27,16 @@ struct Args {
     sound: Option<String>,
 
     /// Fade out duration in seconds
-    #[arg(short, long, env = "VH_NOTIFICATION_FADE_OUT", default_value_t = 0.3)]
-    fade_out: f32,
+    #[arg(short, long, env = "VH_NOTIFICATION_FADE_OUT")]
+    fade_out: Option<f32>,
 
     /// Fade in duration in seconds
-    #[arg(short, long, env = "VH_NOTIFICATION_FADE_IN", default_value_t = 0.3)]
-    fade_in: f32,
+    #[arg(short, long, env = "VH_NOTIFICATION_FADE_IN")]
+    fade_in: Option<f32>,
 
     /// Output volume percentage for notification sound (0-100)
-    #[arg(short, long, env = "VH_NOTIFICATION_VOLUME", default_value_t = 75)]
-    volume: u8,
+    #[arg(short, long, env = "VH_NOTIFICATION_VOLUME")]
+    volume: Option<u8>,
 
     /// Path to config file
     #[arg(short, long, env = "VH_NOTIFICATION_CONFIG")]
@@ -146,6 +146,7 @@ fn main() -> Result<()> {
     })
     .expect("Error setting Ctrl-C handler");
 
+    // Parse all arguments
     let args = Args::parse();
     
     // Load config file if specified or look for default locations
@@ -174,12 +175,27 @@ fn main() -> Result<()> {
         }
     };
     
-    // Determine fade durations (priority: args > config > defaults)
-    let fade_out = args.fade_out;
-    let fade_in = args.fade_in;
+    // Determine parameters with proper precedence: command line > environment > config > defaults
+    // Command line args are now Option types, so we can directly check if they were provided
     
-    // Determine output volume (priority: args > config > defaults)
-    let volume = args.volume.min(100);
+    // For fade_out: command line > environment > config > default (0.3)
+    let fade_out = args.fade_out
+        .or_else(|| std::env::var("VH_NOTIFICATION_FADE_OUT").ok().and_then(|v| v.parse().ok()))
+        .or(config.fade_out)
+        .unwrap_or(0.3);
+    
+    // For fade_in: command line > environment > config > default (0.3)
+    let fade_in = args.fade_in
+        .or_else(|| std::env::var("VH_NOTIFICATION_FADE_IN").ok().and_then(|v| v.parse().ok()))
+        .or(config.fade_in)
+        .unwrap_or(0.3);
+    
+    // For volume: command line > environment > config > default (75), capped at 100
+    let volume = args.volume
+        .or_else(|| std::env::var("VH_NOTIFICATION_VOLUME").ok().and_then(|v| v.parse().ok()))
+        .or(config.volume)
+        .unwrap_or(75)
+        .min(100);
     
     // Resolve sound path (check if it's an alias in config)
     let sound_path = resolve_sound_path(&sound, &config)?;
