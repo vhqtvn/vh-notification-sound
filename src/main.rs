@@ -517,7 +517,7 @@ fn run_notification_server(
     // Get initial PulseAudio state once for the entire server
     let state = get_pulseaudio_state()?;
     let mut guard = AudioStateGuard::new(state);
-    let enable_fading = !guard.unmuted_inputs.is_empty();
+    let enable_fading = !guard.unmuted_inputs.is_empty() && fade_in >= 0.0 && fade_out >= 0.0;
     // only control volume if there are no unmuted inputs
     let enable_volume_control = guard.unmuted_inputs.is_empty();
 
