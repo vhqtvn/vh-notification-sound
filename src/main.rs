@@ -18,6 +18,12 @@ use std::{
 // Import specific items from libc instead of the entire module
 use libc::{close, dup2, fork, setsid, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 
+macro_rules! pactl {
+    ($($args:expr),*) => {
+        run_command("pactl", &[$($args),*])
+    };
+}
+
 // Define notification states for state tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum NotificationState {
@@ -117,6 +123,9 @@ struct AudioStateGuard {
     cleaned_up: bool,
     // Current fade state (0 = fully faded out, FADE_STEPS = full volume)
     fade_state: u8,
+    needs_restore_volume: bool,
+    needs_unmute_inputs: bool,
+    cleanup_signal: Arc<AtomicBool>,
 }
 
 impl AudioStateGuard {
@@ -125,9 +134,36 @@ impl AudioStateGuard {
             default_sink: state.default_sink,
             current_volume: state.current_volume,
             unmuted_inputs: state.unmuted_inputs,
+            needs_restore_volume: false,
+            needs_unmute_inputs: false,
             cleaned_up: false,
             fade_state: FADE_STEPS, // Start at full volume
+            cleanup_signal: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_needs_restore_volume(&mut self) {
+        self.needs_restore_volume = true;
+        self.cleaned_up = false;
+    }
+
+    pub fn set_needs_unmute_inputs(&mut self) {
+        self.needs_unmute_inputs = true;
+        self.cleaned_up = false;
+    }
+
+    fn mute_inputs(&mut self) -> Result<()> {
+        self.set_needs_unmute_inputs();
+        for input in &self.unmuted_inputs {
+            _ = pactl!("set-sink-input-mute", input, "1");
+        }
+        Ok(())
+    }
+
+    fn set_volume(&mut self, volume: u8) -> Result<()> {
+        self.set_needs_restore_volume();
+        pactl!("set-sink-volume", &self.default_sink, &format!("{}%", volume))?;
+        Ok(())
     }
 
     fn cleanup(&mut self) -> Result<()> {
@@ -135,22 +171,150 @@ impl AudioStateGuard {
             return Ok(());
         }
 
+        // Signal any running fades to stop
+        self.cleanup_signal.store(true, Ordering::SeqCst);
+
+        let mut errors = Vec::new();
+
         // Restore original volume
-        run_command(
-            "pactl",
-            &[
-                "set-sink-volume",
-                &self.default_sink,
-                &format!("{}%", self.current_volume),
-            ],
-        )?;
+        if self.needs_restore_volume {
+            if let Err(e) = pactl!("set-sink-volume", &self.default_sink, &format!("{}%", self.current_volume)) {
+                errors.push(format!("Failed to restore volume: {}", e));
+            }
+            self.needs_restore_volume = false;
+        }
 
         // Unmute streams that were unmuted initially
-        for input in &self.unmuted_inputs {
-            run_command("pactl", &["set-sink-input-mute", input, "0"])?;
+        if self.needs_unmute_inputs {
+            for input in &self.unmuted_inputs {
+                if let Err(e) = pactl!("set-sink-input-mute", input, "0") {
+                    errors.push(format!("Failed to unmute input {}: {}", input, e));
+                }
+            }
+            self.needs_unmute_inputs = false;
         }
 
         self.cleaned_up = true;
+
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(anyhow::anyhow!("{}", errors[0])),
+            _ => Err(anyhow::anyhow!(
+                "Multiple cleanup errors occurred:\n{}",
+                errors.join("\n")
+            )),
+        }
+    }
+
+    /// Prepare audio for notification by fading out and muting if needed
+    fn prepare_for_notification(&mut self, fade_out: f32, enable_fading: bool, enable_volume_control: bool, volume: u8, running: &Arc<AtomicBool>) -> Result<()> {
+        // Only prepare if not already prepared
+        if self.fade_state == FADE_STEPS {
+            // Fade out if needed and we have active audio streams
+            if enable_fading && fade_out > 0.0 && running.load(Ordering::SeqCst) {
+                self.fade_out(fade_out, running)?;
+            } else {
+                // If we're skipping the fade out, set fade_state to 0 (fully faded out)
+                self.fade_state = 0;
+            }
+
+            // Check if we should continue (user might have interrupted)
+            if !running.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+
+            if enable_fading {
+                self.mute_inputs()?;
+            }
+
+            if enable_volume_control {
+                self.set_volume(volume)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore audio state after notification by unmuting and fading in if needed
+    fn restore_after_notification(&mut self, fade_in: f32, enable_fading: bool, running: &Arc<AtomicBool>) -> Result<()> {
+        if enable_fading {
+            // Unmute all previously unmuted inputs
+            for input in &self.unmuted_inputs {
+                _ = pactl!("set-sink-input-mute", input, "0");
+            }
+        }
+
+        // Fade in if needed
+        if enable_fading && fade_in > 0.0 && running.load(Ordering::SeqCst) {
+            self.fade_in(fade_in, running)?;
+        } else {
+            // If we skipped fade-in, make sure volume is restored
+            if self.needs_restore_volume {
+                _ = pactl!("set-sink-volume", &self.default_sink, &format!("{}%", self.current_volume));
+            }
+            self.fade_state = FADE_STEPS; // Fully faded in
+        }
+        Ok(())
+    }
+
+    fn fade_out(&mut self, fade_out: f32, running: &Arc<AtomicBool>) -> Result<()> {
+        self.cleanup_signal.store(false, Ordering::SeqCst);
+        self.set_needs_restore_volume();
+        // Use the existing fade_state as the starting point
+        let start_step = self.fade_state;
+        let fade_out_step_duration = Duration::from_secs_f32(fade_out / FADE_STEPS as f32);
+
+        // Starting from current fade_state and going down to 0
+        for step in (0..start_step).rev() {
+            if !running.load(Ordering::SeqCst) || self.cleanup_signal.load(Ordering::SeqCst) {
+                // Remember the current fade state before exiting
+                self.fade_state = step + 1;
+                break;
+            }
+
+            let volume_factor = step as f32 / FADE_STEPS as f32;
+            let step_volume = (self.current_volume as f32 * volume_factor) as u8;
+
+            pactl!("set-sink-volume", &self.default_sink, &format!("{}%", step_volume))?;
+
+            // Update the fade state after each step
+            self.fade_state = step;
+
+            thread::sleep(fade_out_step_duration);
+        }
+
+        Ok(())
+    }
+
+    fn fade_in(&mut self, fade_in: f32, running: &Arc<AtomicBool>) -> Result<()> {
+        self.cleanup_signal.store(false, Ordering::SeqCst);
+        // Use the existing fade_state as the starting point
+        let start_step = self.fade_state;
+        let fade_in_step_duration = Duration::from_secs_f32(fade_in / FADE_STEPS as f32);
+
+        // Starting from current fade_state and going up to FADE_STEPS
+        for step in start_step..=FADE_STEPS {
+            if !running.load(Ordering::SeqCst) || self.cleanup_signal.load(Ordering::SeqCst) {
+                // Remember the current fade state before exiting
+                self.fade_state = step;
+                break;
+            }
+
+            let volume_factor = step as f32 / FADE_STEPS as f32;
+            let step_volume = (self.current_volume as f32 * volume_factor) as u8;
+
+            pactl!("set-sink-volume", &self.default_sink, &format!("{}%", step_volume))?;
+
+            // Update the fade state after each step
+            self.fade_state = step;
+
+            thread::sleep(fade_in_step_duration);
+        }
+
+        // Final volume restoration only if not cleaning up
+        if !self.cleanup_signal.load(Ordering::SeqCst) {
+            pactl!("set-sink-volume", &self.default_sink, &format!("{}%", self.current_volume))?;
+        }
+
         Ok(())
     }
 }
@@ -173,6 +337,7 @@ struct NotificationContext<'a> {
     notification_queue: &'a Arc<Mutex<Vec<PathBuf>>>,
     guard: &'a mut AudioStateGuard,
     enable_fading: bool,
+    enable_volume_control: bool,
     audio_already_prepared: bool,
 }
 
@@ -353,6 +518,8 @@ fn run_notification_server(
     let state = get_pulseaudio_state()?;
     let mut guard = AudioStateGuard::new(state);
     let enable_fading = !guard.unmuted_inputs.is_empty();
+    // only control volume if there are no unmuted inputs
+    let enable_volume_control = guard.unmuted_inputs.is_empty();
 
     // Track whether audio is already prepared for notifications
     // Audio is considered prepared when fade_state is close to 0 (faded out)
@@ -388,6 +555,7 @@ fn run_notification_server(
             notification_queue: &notification_queue,
             guard: &mut guard,
             enable_fading,
+            enable_volume_control,
             audio_already_prepared,
         };
 
@@ -440,33 +608,19 @@ fn play_notification(ctx: &mut NotificationContext) -> Result<(bool, bool)> {
             update_lock_file(ctx.lock_path, &lock_info)?;
         }
 
-        // Fade out if needed and we have active audio streams
-        if ctx.enable_fading && ctx.fade_out > 0.0 && ctx.running.load(Ordering::SeqCst) {
-            fade_audio_out(ctx.guard, ctx.fade_out, ctx.running)?;
-        } else {
-            // If we're skipping the fade out, set fade_state to 0 (fully faded out)
-            ctx.guard.fade_state = 0;
-        }
+        // Prepare audio for notification
+        ctx.guard.prepare_for_notification(
+            ctx.fade_out,
+            ctx.enable_fading,
+            ctx.enable_volume_control,
+            ctx.volume,
+            ctx.running,
+        )?;
 
         // Check if we should continue (user might have interrupted)
         if !ctx.running.load(Ordering::SeqCst) {
             return Ok((false, false));
         }
-
-        // Mute all unmuted sink inputs
-        for input in &ctx.guard.unmuted_inputs {
-            run_command("pactl", &["set-sink-input-mute", input, "1"])?;
-        }
-
-        // Set volume for notification
-        run_command(
-            "pactl",
-            &[
-                "set-sink-volume",
-                &ctx.guard.default_sink,
-                &format!("{}%", ctx.volume),
-            ],
-        )?;
     }
 
     // Update lock file state to Playing
@@ -521,8 +675,7 @@ fn play_notification(ctx: &mut NotificationContext) -> Result<(bool, bool)> {
     let _ = monitor_thread.join();
 
     // Check if we were interrupted or have a new notification waiting
-    if should_interrupt.load(Ordering::SeqCst) || !ctx.notification_queue.lock().unwrap().is_empty()
-    {
+    if should_interrupt.load(Ordering::SeqCst) || !ctx.notification_queue.lock().unwrap().is_empty() {
         _was_interrupted = true;
         // Keep fade_state as is - we're already faded out
         // Skip fade-in if interrupted or new notification waiting
@@ -540,32 +693,13 @@ fn play_notification(ctx: &mut NotificationContext) -> Result<(bool, bool)> {
         update_lock_file(ctx.lock_path, &lock_info)?;
     }
 
-    // Unmute all previously unmuted inputs
-    for input in &ctx.guard.unmuted_inputs {
-        run_command("pactl", &["set-sink-input-mute", input, "0"])?;
-    }
+    // Restore audio state after notification
+    ctx.guard.restore_after_notification(ctx.fade_in, ctx.enable_fading, ctx.running)?;
 
-    // Fade in if needed
-    if ctx.enable_fading && ctx.fade_in > 0.0 && ctx.running.load(Ordering::SeqCst) {
-        fade_audio_in(ctx.guard, ctx.fade_in, ctx.running, ctx.notification_queue)?;
-
-        // Check again after fade-in if we were interrupted
-        if !ctx.notification_queue.lock().unwrap().is_empty() {
-            _was_interrupted = true;
-            // fade_state is already updated in fade_audio_in
-            return Ok((false, true));
-        }
-    } else {
-        // If we skipped fade-in, make sure volume is restored and fade_state is reset
-        run_command(
-            "pactl",
-            &[
-                "set-sink-volume",
-                &ctx.guard.default_sink,
-                &format!("{}%", ctx.guard.current_volume),
-            ],
-        )?;
-        ctx.guard.fade_state = FADE_STEPS; // Fully faded in
+    // Check again after fade-in if we were interrupted
+    if !ctx.notification_queue.lock().unwrap().is_empty() {
+        _was_interrupted = true;
+        return Ok((false, true));
     }
 
     // Update lock file state to Idle
@@ -576,100 +710,6 @@ fn play_notification(ctx: &mut NotificationContext) -> Result<(bool, bool)> {
 
     // Return completion status: (completed successfully, was interrupted)
     Ok((true, false))
-}
-
-fn fade_audio_out(
-    guard: &mut AudioStateGuard,
-    fade_out: f32,
-    running: &Arc<AtomicBool>,
-) -> Result<()> {
-    // Use the existing fade_state as the starting point
-    let start_step = guard.fade_state;
-    let fade_out_step_duration = Duration::from_secs_f32(fade_out / FADE_STEPS as f32);
-
-    // Starting from current fade_state and going down to 0
-    for step in (0..start_step).rev() {
-        if !running.load(Ordering::SeqCst) {
-            // Remember the current fade state before exiting
-            guard.fade_state = step + 1;
-            break;
-        }
-
-        let volume_factor = step as f32 / FADE_STEPS as f32;
-        let step_volume = (guard.current_volume as f32 * volume_factor) as u8;
-
-        run_command(
-            "pactl",
-            &[
-                "set-sink-volume",
-                &guard.default_sink,
-                &format!("{}%", step_volume),
-            ],
-        )?;
-
-        // Update the fade state after each step
-        guard.fade_state = step;
-
-        thread::sleep(fade_out_step_duration);
-    }
-
-    Ok(())
-}
-
-fn fade_audio_in(
-    guard: &mut AudioStateGuard,
-    fade_in: f32,
-    running: &Arc<AtomicBool>,
-    notification_queue: &Arc<Mutex<Vec<PathBuf>>>,
-) -> Result<()> {
-    // Use the existing fade_state as the starting point
-    let start_step = guard.fade_state;
-    let fade_in_step_duration = Duration::from_secs_f32(fade_in / FADE_STEPS as f32);
-
-    // Starting from current fade_state and going up to FADE_STEPS
-    for step in start_step..=FADE_STEPS {
-        // Check for new notifications
-        if !notification_queue.lock().unwrap().is_empty() {
-            // New notification came in, remember current fade state
-            guard.fade_state = step;
-            return Ok(());
-        }
-
-        if !running.load(Ordering::SeqCst) {
-            // Remember the current fade state before exiting
-            guard.fade_state = step;
-            break;
-        }
-
-        let volume_factor = step as f32 / FADE_STEPS as f32;
-        let step_volume = (guard.current_volume as f32 * volume_factor) as u8;
-
-        run_command(
-            "pactl",
-            &[
-                "set-sink-volume",
-                &guard.default_sink,
-                &format!("{}%", step_volume),
-            ],
-        )?;
-
-        // Update the fade state after each step
-        guard.fade_state = step;
-
-        thread::sleep(fade_in_step_duration);
-    }
-
-    // Final volume restoration
-    run_command(
-        "pactl",
-        &[
-            "set-sink-volume",
-            &guard.default_sink,
-            &format!("{}%", guard.current_volume),
-        ],
-    )?;
-
-    Ok(())
 }
 
 fn load_config(config_path: &Option<PathBuf>) -> Result<Config> {
@@ -744,14 +784,14 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<String> {
 
 fn get_pulseaudio_state() -> Result<PulseAudioState> {
     // Get default sink
-    let default_sink = run_command("pactl", &["info"])?
+    let default_sink = pactl!("info")?
         .lines()
         .find(|line| line.contains("Default Sink"))
         .map(|line| line.split(": ").nth(1).unwrap_or("").trim().to_string())
         .context("Failed to get default sink")?;
 
     // Get current volume
-    let volume_output = run_command("pactl", &["list", "sinks"])?;
+    let volume_output = pactl!("list", "sinks")?;
     let current_volume_str = volume_output
         .lines()
         .skip_while(|line| !line.contains(&format!("Name: {}", default_sink)))
@@ -762,14 +802,14 @@ fn get_pulseaudio_state() -> Result<PulseAudioState> {
         .context("Failed to get current volume")?;
 
     // Get unmuted sink inputs
-    let sink_inputs_output = run_command("pactl", &["list", "short", "sink-inputs"])?;
+    let sink_inputs_output = pactl!("list", "short", "sink-inputs")?;
     let sink_input_ids: Vec<String> = sink_inputs_output
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| line.split_whitespace().next().unwrap_or("").to_string())
         .collect();
 
-    let sink_inputs_details = run_command("pactl", &["list", "sink-inputs"])?;
+    let sink_inputs_details = pactl!("list", "sink-inputs")?;
     let mut unmuted_inputs = Vec::new();
 
     for id in sink_input_ids {
