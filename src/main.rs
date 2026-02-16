@@ -57,12 +57,16 @@ struct Args {
     #[arg(index = 1)]
     sound: Option<String>,
 
-    /// Fade out duration in seconds
-    #[arg(short, long, env = "VH_NOTIFICATION_FADE_OUT")]
+    /// Fade duration in seconds (sets both fade-in and fade-out)
+    #[arg(short = 'f', long, env = "VH_NOTIFICATION_FADE")]
+    fade: Option<f32>,
+
+    /// Fade out duration in seconds (overrides -f/--fade for fade-out)
+    #[arg(long, env = "VH_NOTIFICATION_FADE_OUT")]
     fade_out: Option<f32>,
 
-    /// Fade in duration in seconds
-    #[arg(short, long, env = "VH_NOTIFICATION_FADE_IN")]
+    /// Fade in duration in seconds (overrides -f/--fade for fade-in)
+    #[arg(long, env = "VH_NOTIFICATION_FADE_IN")]
     fade_in: Option<f32>,
 
     /// Output volume percentage for notification sound (0-100)
@@ -225,6 +229,11 @@ impl AudioStateGuard {
 
             if enable_fading {
                 self.mute_inputs()?;
+                // Restore volume to original level so notification can play at full volume
+                // The existing streams are muted, so this won't be audible
+                if self.needs_restore_volume {
+                    pactl!("set-sink-volume", &self.default_sink, &format!("{}%", self.current_volume))?;
+                }
             }
 
             if enable_volume_control {
@@ -264,10 +273,11 @@ impl AudioStateGuard {
         let fade_out_step_duration = Duration::from_secs_f32(fade_out / FADE_STEPS as f32);
 
         // Starting from current fade_state and going down to 0
-        for step in (0..start_step).rev() {
+        // Include start_step in the loop so we start from full volume
+        for step in (0..=start_step).rev() {
             if !running.load(Ordering::SeqCst) || self.cleanup_signal.load(Ordering::SeqCst) {
                 // Remember the current fade state before exiting
-                self.fade_state = step + 1;
+                self.fade_state = step;
                 break;
             }
 
@@ -279,7 +289,10 @@ impl AudioStateGuard {
             // Update the fade state after each step
             self.fade_state = step;
 
-            thread::sleep(fade_out_step_duration);
+            // Don't sleep after the last step
+            if step > 0 {
+                thread::sleep(fade_out_step_duration);
+            }
         }
 
         Ok(())
@@ -307,7 +320,10 @@ impl AudioStateGuard {
             // Update the fade state after each step
             self.fade_state = step;
 
-            thread::sleep(fade_in_step_duration);
+            // Don't sleep after the last step
+            if step < FADE_STEPS {
+                thread::sleep(fade_in_step_duration);
+            }
         }
 
         // Final volume restoration only if not cleaning up
@@ -372,33 +388,19 @@ fn main() -> Result<()> {
     };
 
     // Determine parameters with proper precedence: command line > environment > config > defaults
-    let fade_out = args
-        .fade_out
-        .or_else(|| {
-            std::env::var("VH_NOTIFICATION_FADE_OUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
+    // Note: clap automatically reads from environment variables (via env attribute) if CLI arg is not provided
+    // For fade durations: --fade-out/--fade-in override --fade, which overrides config, which has defaults
+    let fade_out = args.fade_out
+        .or(args.fade)
         .or(config.fade_out)
         .unwrap_or(0.3);
 
-    let fade_in = args
-        .fade_in
-        .or_else(|| {
-            std::env::var("VH_NOTIFICATION_FADE_IN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
+    let fade_in = args.fade_in
+        .or(args.fade)
         .or(config.fade_in)
         .unwrap_or(0.3);
 
-    let volume = args
-        .volume
-        .or_else(|| {
-            std::env::var("VH_NOTIFICATION_VOLUME")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
+    let volume = args.volume
         .or(config.volume)
         .unwrap_or(75)
         .min(100);
@@ -669,10 +671,16 @@ fn play_notification(ctx: &mut NotificationContext) -> Result<(bool, bool)> {
     });
 
     // Play the sound in the main thread (we'll interrupt if needed)
-    let _play_result = run_command("paplay", &[&sound_path_str]);
+    let play_result = run_command("paplay", &[&sound_path_str]);
     play_running.store(false, Ordering::SeqCst);
     // Wait for the monitor thread to finish
     let _ = monitor_thread.join();
+    
+    // Check if paplay failed
+    if let Err(e) = play_result {
+        eprintln!("Warning: Failed to play notification sound: {}", e);
+        eprintln!("Sound path: {}", sound_path_str);
+    }
 
     // Check if we were interrupted or have a new notification waiting
     if should_interrupt.load(Ordering::SeqCst) || !ctx.notification_queue.lock().unwrap().is_empty() {
@@ -924,8 +932,9 @@ fn print_help_info() {
     println!("  <SOUND>  Sound alias from config or path to audio file");
     println!();
     println!("OPTIONS:");
-    println!("  -f, --fade-out <SECONDS>   Fade out duration in seconds [default: 0.3]");
-    println!("  -i, --fade-in <SECONDS>    Fade in duration in seconds [default: 0.3]");
+    println!("  -f, --fade <SECONDS>       Fade duration for both in and out [default: 0.3]");
+    println!("      --fade-out <SECONDS>   Fade out duration (overrides -f) [default: 0.3]");
+    println!("      --fade-in <SECONDS>    Fade in duration (overrides -f) [default: 0.3]");
     println!("  -v, --volume <PERCENT>     Output volume percentage (0-100) [default: 75]");
     println!("  -c, --config <FILE>        Path to config file");
     println!("  -l, --list-sounds          List available sound aliases from config");
@@ -934,6 +943,7 @@ fn print_help_info() {
     println!("      --help                 Show the automatically generated help message");
     println!();
     println!("ENVIRONMENT VARIABLES:");
+    println!("  VH_NOTIFICATION_FADE       Default fade duration for both in and out");
     println!("  VH_NOTIFICATION_FADE_OUT   Default fade-out duration in seconds");
     println!("  VH_NOTIFICATION_FADE_IN    Default fade-in duration in seconds");
     println!("  VH_NOTIFICATION_VOLUME     Default output volume percentage (0-100)");
@@ -942,6 +952,7 @@ fn print_help_info() {
     println!();
     println!("EXAMPLES:");
     println!("  vh-notification-sound default");
+    println!("  vh-notification-sound -f 0.5 default");
     println!("  vh-notification-sound --fade-out 0.5 --fade-in 0.2 --volume 80 /path/to/sound.mp3");
     println!("  vh-notification-sound -d default");
     println!("  vh-notification-sound -l");

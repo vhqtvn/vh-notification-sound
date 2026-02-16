@@ -9,6 +9,17 @@ REPO_OWNER="vhqtvn"
 REPO_NAME="vh-notification-sound"
 BINARY_NAME="vh-notification-sound"
 
+# Detect if running in local repository
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IS_LOCAL_REPO=false
+# Check multiple conditions to ensure this is actually the vh-notification-sound repo
+if [ -f "$SCRIPT_DIR/Cargo.toml" ] && \
+   [ -d "$SCRIPT_DIR/src" ] && \
+   [ -f "$SCRIPT_DIR/src/main.rs" ] && \
+   grep -q "name = \"vh-notification-sound\"" "$SCRIPT_DIR/Cargo.toml" 2>/dev/null; then
+    IS_LOCAL_REPO=true
+fi
+
 # ANSI color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -46,11 +57,18 @@ check_sudo() {
 check_dependencies() {
     local missing_deps=()
     
-    for cmd in curl jq tar; do
-        if ! command_exists "$cmd"; then
-            missing_deps+=("$cmd")
+    # If local repo, check for cargo instead of curl/jq/tar
+    if [ "$IS_LOCAL_REPO" = true ]; then
+        if ! command_exists cargo; then
+            missing_deps+=("cargo")
         fi
-    done
+    else
+        for cmd in curl jq tar; do
+            if ! command_exists "$cmd"; then
+                missing_deps+=("$cmd")
+            fi
+        done
+    fi
     
     if [ ${#missing_deps[@]} -gt 0 ]; then
         print_message "$RED" "Error: The following dependencies are missing:"
@@ -59,9 +77,13 @@ check_dependencies() {
         done
         
         print_message "$YELLOW" "Please install them and try again."
-        print_message "$BLUE" "On Debian/Ubuntu: sudo apt-get install ${missing_deps[*]}"
-        print_message "$BLUE" "On Fedora/RHEL: sudo dnf install ${missing_deps[*]}"
-        print_message "$BLUE" "On Arch Linux: sudo pacman -S ${missing_deps[*]}"
+        if [ "$IS_LOCAL_REPO" = true ]; then
+            print_message "$BLUE" "Install Rust from: https://rustup.rs/"
+        else
+            print_message "$BLUE" "On Debian/Ubuntu: sudo apt-get install ${missing_deps[*]}"
+            print_message "$BLUE" "On Fedora/RHEL: sudo dnf install ${missing_deps[*]}"
+            print_message "$BLUE" "On Arch Linux: sudo pacman -S ${missing_deps[*]}"
+        fi
         exit 1
     fi
 }
@@ -129,6 +151,59 @@ get_latest_release_url() {
     
     # Return the download URL without any additional output
     printf "%s" "$download_url"
+}
+
+# Function to build from local source
+build_from_source() {
+    print_message "$BLUE" "Building from local source..."
+    
+    # Change to script directory (repo root)
+    cd "$SCRIPT_DIR"
+    
+    # Build the project in release mode
+    if ! cargo build --release; then
+        print_message "$RED" "Error: Failed to build the project."
+        exit 1
+    fi
+    
+    local binary_path="$SCRIPT_DIR/target/release/$BINARY_NAME"
+    
+    if [ ! -f "$binary_path" ]; then
+        print_message "$RED" "Error: Built binary not found at $binary_path"
+        exit 1
+    fi
+    
+    print_message "$BLUE" "Installing to $INSTALL_DIR/$BINARY_NAME..."
+    
+    # Create the installation directory if it doesn't exist
+    mkdir -p "$INSTALL_DIR"
+    
+    # Copy the binary to the installation directory
+    MAYBE_SUDO=
+    if [ "$IS_LOCAL_REPO" = true ] && [ "$EUID" -ne 0 ]; then
+        MAYBE_SUDO="sudo"
+    fi
+    if ! $MAYBE_SUDO cp "$binary_path" "$INSTALL_DIR/$BINARY_NAME"; then
+        print_message "$RED" "Error: Failed to copy the binary to $INSTALL_DIR."
+        print_message "$YELLOW" "You may need to run this script with sudo."
+        exit 1
+    fi
+    
+    # Make the binary executable
+    $MAYBE_SUDO chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    
+    # Copy the config file if it exists
+    if [ -f "$SCRIPT_DIR/vh-notification-sound.yml" ]; then
+        print_message "$BLUE" "Installing config file to $CONFIG_DIR/vh-notification-sound.yml..."
+        if [ -f "$CONFIG_DIR/vh-notification-sound.yml" ]; then
+            print_message "$YELLOW" "Warning: $CONFIG_DIR/vh-notification-sound.yml already exists. Skipping."
+        else
+            mkdir -p "$CONFIG_DIR"
+            cp "$SCRIPT_DIR/vh-notification-sound.yml" "$CONFIG_DIR/vh-notification-sound.yml"
+        fi
+    fi
+    
+    print_message "$GREEN" "Installation complete! The vh-notification-sound binary is now available at $INSTALL_DIR/$BINARY_NAME"
 }
 
 # Function to download and install the binary
@@ -212,11 +287,15 @@ main() {
                 ;;
             --help)
                 echo "Usage: curl -sSL https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/install.sh | bash -s -- [OPTIONS]"
+                echo "   or: ./install.sh [OPTIONS]  (when running from local repository)"
                 echo ""
                 echo "Options:"
                 echo "  --dir=PATH        Set the installation directory (default: /usr/local/bin)"
                 echo "  --config-dir=PATH Set the configuration directory (default: ~/.config)"
                 echo "  --help            Show this help message"
+                echo ""
+                echo "When run from a local repository (detected by presence of Cargo.toml and src/),"
+                echo "the script will build from source instead of downloading a pre-built binary."
                 exit 0
                 ;;
             *)
@@ -229,6 +308,12 @@ main() {
     print_message "$BLUE" "vh-notification-sound installer"
     print_message "$BLUE" "================================"
     
+    # Check if running in local repository
+    if [ "$IS_LOCAL_REPO" = true ]; then
+        print_message "$GREEN" "Detected local repository environment"
+        print_message "$BLUE" "Building from source instead of downloading..."
+    fi
+    
     # Check if running with sudo
     check_sudo
     
@@ -238,18 +323,24 @@ main() {
     # Check PulseAudio
     check_pulseaudio
     
-    # Detect architecture
-    local arch
-    arch=$(detect_arch)
-    print_message "$BLUE" "Detected architecture: $arch"
-    
-    # Get the latest release URL - capture output to variable without any additional output
-    print_message "$BLUE" "Fetching latest release information..."
-    local download_url
-    download_url=$(get_latest_release_url "$arch")
-    
-    # Install the binary
-    install_binary "$download_url"
+    # Install based on environment
+    if [ "$IS_LOCAL_REPO" = true ]; then
+        # Build and install from local source
+        build_from_source
+    else
+        # Detect architecture
+        local arch
+        arch=$(detect_arch)
+        print_message "$BLUE" "Detected architecture: $arch"
+        
+        # Get the latest release URL - capture output to variable without any additional output
+        print_message "$BLUE" "Fetching latest release information..."
+        local download_url
+        download_url=$(get_latest_release_url "$arch")
+        
+        # Install the binary
+        install_binary "$download_url"
+    fi
     
     print_message "$GREEN" "You can now run vh-notification-sound to play notification sounds!"
     print_message "$GREEN" "Example: $INSTALL_DIR/$BINARY_NAME /path/to/sound.mp3"
