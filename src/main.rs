@@ -520,8 +520,10 @@ fn run_notification_server(
     let state = get_pulseaudio_state()?;
     let mut guard = AudioStateGuard::new(state);
     let enable_fading = !guard.unmuted_inputs.is_empty() && fade_in >= 0.0 && fade_out >= 0.0;
-    // only control volume if there are no unmuted inputs
-    let enable_volume_control = guard.unmuted_inputs.is_empty();
+    // Control volume when it's safe:
+    // - no active inputs, or
+    // - active inputs are being faded/muted during notification playback.
+    let enable_volume_control = guard.unmuted_inputs.is_empty() || enable_fading;
 
     // Track whether audio is already prepared for notifications
     // Audio is considered prepared when fade_state is close to 0 (faded out)
